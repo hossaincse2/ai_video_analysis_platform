@@ -7,21 +7,72 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 from models import Video
 import re
+import sys
+import traceback
 
 logger = logging.getLogger(__name__)
 
 
 class YouTubeService:
     def __init__(self):
-        self.download_dir = Path("downloads")
+        # Use absolute paths to avoid Windows issues
+        self.download_dir = Path.cwd() / "downloads"
         self.download_dir.mkdir(exist_ok=True)
 
+        logger.info(f"Download directory: {self.download_dir.absolute()}")
+        logger.info(f"Current working directory: {Path.cwd()}")
+        logger.info(f"Python executable: {sys.executable}")
+
+    def test_system(self) -> dict:
+        """Test system capabilities and find potential issues"""
+        results = {
+            "python_executable": sys.executable,
+            "working_directory": str(Path.cwd()),
+            "download_directory": str(self.download_dir.absolute()),
+            "download_dir_exists": self.download_dir.exists(),
+            "download_dir_writable": False,
+            "yt_dlp_import": False,
+            "yt_dlp_version": None,
+            "test_file_creation": False,
+            "errors": []
+        }
+
+        try:
+            # Test directory write permissions
+            test_file = self.download_dir / "test_write.txt"
+            test_file.write_text("test")
+            test_file.unlink()
+            results["download_dir_writable"] = True
+        except Exception as e:
+            results["errors"].append(f"Directory write test failed: {e}")
+
+        try:
+            # Test yt-dlp import and version
+            import yt_dlp
+            results["yt_dlp_import"] = True
+            results["yt_dlp_version"] = yt_dlp.version.__version__
+        except Exception as e:
+            results["errors"].append(f"yt-dlp import failed: {e}")
+
+        try:
+            # Test yt-dlp basic functionality
+            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                # Test with a simple URL extraction (no download)
+                info = ydl.extract_info("https://www.youtube.com/watch?v=dQw4w9WgXcQ", download=False)
+                results["yt_dlp_basic_test"] = True
+        except Exception as e:
+            results["errors"].append(f"yt-dlp basic test failed: {e}")
+
+        return results
+
     async def download_video(self, url: str, db: Session) -> dict:
-        """Download YouTube video and extract audio"""
+        """Download YouTube audio with enhanced error handling"""
         video_id = str(uuid.uuid4())
 
         try:
-            logger.info(f"Starting download for URL: {url}")
+            logger.info(f"=== Starting download for URL: {url} ===")
+            logger.info(f"Video ID: {video_id}")
+            logger.info(f"Download directory: {self.download_dir.absolute()}")
 
             # Create initial video record
             video = Video(
@@ -32,86 +83,137 @@ class YouTubeService:
             )
             db.add(video)
             db.commit()
+            logger.info("Video record created in database")
 
-            # Configure yt-dlp options for audio extraction
-            # ydl_opts = {
-            #     'format': 'bestaudio/best',
-            #     'outtmpl': str(self.download_dir / f'{video_id}_%(title)s.%(ext)s'),
-            #     'postprocessors': [{
-            #         'key': 'FFmpegExtractAudio',
-            #         'preferredcodec': 'mp3',
-            #         'preferredquality': '192',
-            #     }],
-            #     'noplaylist': True,
-            #     'quiet': True,
-            #     'no_warnings': True,
-            #     'extractaudio': True,
-            #     'audioformat': 'mp3',
-            #     # Add FFmpeg path if not in system PATH
-            #     'ffmpeg_location': '/path/to/ffmpeg',  # Update with actual path
-            # }
+            # Create output template with absolute path
+            output_template = str(self.download_dir.absolute() / f'{video_id}_%(title)s.%(ext)s')
+            logger.info(f"Output template: {output_template}")
+
+            # Configure yt-dlp options with explicit paths
             ydl_opts = {
-                'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio',
-                'outtmpl': str(self.download_dir / f'{video_id}_%(title)s.%(ext)s'),
+                'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio[ext=webm]/bestaudio',
+                'outtmpl': output_template,
                 'noplaylist': True,
-                'quiet': True,
-                'no_warnings': True,
-                # Remove postprocessors to avoid FFmpeg requirement
-                # 'postprocessors': [{
-                #     'key': 'FFmpegExtractAudio',
-                #     'preferredcodec': 'mp3',
-                #     'preferredquality': '192',
-                # }],
-                # 'extractaudio': True,
-                # 'audioformat': 'mp3',
+                'quiet': False,  # Enable verbose output for debugging
+                'no_warnings': False,
+                'extractaudio': False,  # Don't try to extract, just download
+                'writesubtitles': False,
+                'writeautomaticsub': False,
+                'ignoreerrors': False,
             }
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Get video info first
-                logger.info("Extracting video information...")
-                info = ydl.extract_info(url, download=False)
+            logger.info("Creating yt-dlp instance...")
 
-                title = info.get('title', 'Unknown Title')
-                duration = info.get('duration', 0)
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    logger.info("yt-dlp instance created successfully")
 
-                # Clean title for safe filename
-                safe_title = self._sanitize_filename(title)
+                    # Get video info first
+                    logger.info("Extracting video information...")
+                    try:
+                        info = ydl.extract_info(url, download=False)
+                        logger.info("Video info extracted successfully")
+                    except Exception as info_error:
+                        logger.error(f"Failed to extract video info: {info_error}")
+                        logger.error(f"Info error traceback: {traceback.format_exc()}")
+                        raise Exception(f"Could not extract video information: {str(info_error)}")
 
-                logger.info(f"Video info - Title: {title}, Duration: {duration}s")
+                    title = info.get('title', 'Unknown Title')
+                    duration = info.get('duration', 0)
 
-                # Update video record with info
-                video.title = title
-                video.duration = duration
-                db.commit()
+                    # Clean title for logging
+                    safe_title = self._sanitize_filename(title)
+                    logger.info(f"Video Title: {title}")
+                    logger.info(f"Safe Title: {safe_title}")
+                    logger.info(f"Duration: {duration}s")
 
-                # Download and convert to audio
-                logger.info("Downloading and converting to audio...")
-                ydl.download([url])
+                    # Update video record with info
+                    video.title = title
+                    video.duration = duration
+                    db.commit()
+                    logger.info("Video record updated with metadata")
 
-                # Find the downloaded audio file
-                audio_path = self._find_audio_file(video_id, safe_title)
+                    # Download audio
+                    logger.info("Starting download...")
+                    try:
+                        # List files before download
+                        files_before = list(self.download_dir.glob("*"))
+                        logger.info(f"Files before download: {len(files_before)}")
 
-                if not audio_path:
-                    raise Exception("Failed to find downloaded audio file")
+                        ydl.download([url])
+                        logger.info("Download completed successfully")
 
-                # Update video record with audio path
-                video.audio_path = audio_path
-                video.status = "completed"
-                db.commit()
+                        # List files after download
+                        files_after = list(self.download_dir.glob("*"))
+                        logger.info(f"Files after download: {len(files_after)}")
 
-                logger.info(f"Successfully processed video: {title}")
+                        # Show new files
+                        new_files = set(files_after) - set(files_before)
+                        logger.info(f"New files created: {[str(f) for f in new_files]}")
 
-                return {
-                    "id": video_id,
-                    "title": title,
-                    "url": url,
-                    "duration": duration,
-                    "audio_path": audio_path,
-                    "status": "completed"
-                }
+                    except Exception as download_error:
+                        logger.error(f"Download failed: {download_error}")
+                        logger.error(f"Download error traceback: {traceback.format_exc()}")
+                        raise Exception(f"Download failed: {str(download_error)}")
+
+                    # Find the downloaded audio file
+                    audio_path = self._find_audio_file(video_id)
+
+                    if not audio_path:
+                        # Enhanced file search debugging
+                        logger.error("=== FILE SEARCH DEBUG ===")
+                        all_files = list(self.download_dir.glob("*"))
+                        logger.error(f"All files in directory: {[str(f) for f in all_files]}")
+
+                        # Search by time
+                        recent_files = []
+                        current_time = datetime.now().timestamp()
+                        for file in all_files:
+                            if file.is_file():
+                                mod_time = file.stat().st_mtime
+                                if mod_time > (current_time - 600):  # 10 minutes
+                                    recent_files.append((str(file), datetime.fromtimestamp(mod_time)))
+
+                        logger.error(f"Recent files: {recent_files}")
+                        raise Exception("Failed to find downloaded audio file")
+
+                    # Verify file exists and is readable
+                    audio_file_path = Path(audio_path)
+                    if not audio_file_path.exists():
+                        raise Exception(f"Audio file does not exist: {audio_path}")
+
+                    file_size = audio_file_path.stat().st_size
+                    logger.info(f"Audio file size: {file_size} bytes")
+
+                    if file_size == 0:
+                        raise Exception("Downloaded audio file is empty")
+
+                    # Update video record with audio path
+                    video.audio_path = str(audio_file_path.absolute())
+                    video.status = "completed"
+                    db.commit()
+
+                    logger.info(f"=== Successfully processed video: {title} ===")
+                    logger.info(f"Audio file: {video.audio_path}")
+
+                    return {
+                        "id": video_id,
+                        "title": title,
+                        "url": url,
+                        "duration": duration,
+                        "audio_path": video.audio_path,
+                        "status": "completed"
+                    }
+
+            except Exception as ydl_error:
+                logger.error(f"yt-dlp error: {ydl_error}")
+                logger.error(f"yt-dlp traceback: {traceback.format_exc()}")
+                raise ydl_error
 
         except Exception as e:
-            logger.error(f"Error downloading video: {str(e)}")
+            logger.error(f"=== ERROR IN DOWNLOAD PROCESS ===")
+            logger.error(f"Error: {str(e)}")
+            logger.error(f"Full traceback: {traceback.format_exc()}")
 
             # Update video record with error status
             try:
@@ -125,79 +227,78 @@ class YouTubeService:
 
             raise e
 
-    def _find_audio_file(self, video_id: str, safe_title: str) -> str:
-        """Find the downloaded audio file"""
-        possible_extensions = ['.mp3', '.m4a', '.wav', '.aac']
+    def _find_audio_file(self, video_id: str) -> str:
+        """Find the downloaded audio file with enhanced debugging"""
+        # Audio formats that don't need conversion
+        audio_extensions = ['.m4a', '.mp3', '.webm', '.ogg', '.opus', '.aac', '.wav']
 
-        # Search for the audio file with video ID prefix
-        for file in self.download_dir.glob(f"{video_id}_*"):
-            if any(file.name.endswith(ext) for ext in possible_extensions):
-                logger.info(f"Found audio file: {file}")
-                return str(file)
+        logger.info(f"=== SEARCHING FOR AUDIO FILE ===")
+        logger.info(f"Video ID: {video_id}")
+        logger.info(f"Search directory: {self.download_dir.absolute()}")
 
-        # Alternative search for recent files
+        # List all files in directory
+        all_files = list(self.download_dir.glob("*"))
+        logger.info(f"Total files in directory: {len(all_files)}")
+
+        for file in all_files:
+            logger.info(f"  File: {file.name} (size: {file.stat().st_size if file.is_file() else 'N/A'})")
+
+        # Search for files with video ID prefix
+        logger.info(f"Searching for files with prefix: {video_id}_")
+        matching_files = list(self.download_dir.glob(f"{video_id}_*"))
+        logger.info(f"Files with video ID prefix: {len(matching_files)}")
+
+        for file in matching_files:
+            logger.info(f"  Matching file: {file}")
+            if any(file.name.lower().endswith(ext) for ext in audio_extensions):
+                logger.info(f"Found audio file with video ID: {file}")
+                return str(file.absolute())
+
+        # Search for recent audio files (last 10 minutes)
+        logger.info("Searching for recent audio files...")
         current_time = datetime.now().timestamp()
-        for file in self.download_dir.glob("*.mp3"):
-            if file.stat().st_mtime > (current_time - 300):  # Modified in last 5 minutes
-                logger.info(f"Found recent audio file: {file}")
-                return str(file)
 
-        # Last resort: find any recent audio file
-        for ext in possible_extensions:
-            for file in self.download_dir.glob(f"*{ext}"):
-                if file.stat().st_mtime > (current_time - 300):
+        for file in self.download_dir.glob("*"):
+            if file.is_file() and any(file.name.lower().endswith(ext) for ext in audio_extensions):
+                file_mod_time = file.stat().st_mtime
+                age_minutes = (current_time - file_mod_time) / 60
+                logger.info(f"  Audio file: {file.name} (age: {age_minutes:.1f} minutes)")
+
+                if file_mod_time > (current_time - 600):  # 10 minutes
                     logger.info(f"Found recent audio file: {file}")
-                    return str(file)
+                    return str(file.absolute())
 
+        logger.error("No suitable audio file found")
         return None
 
     def _sanitize_filename(self, filename: str) -> str:
-        """Sanitize filename for safe file system usage"""
-        # Remove or replace invalid characters
-        filename = re.sub(r'[<>:"/\\|?*]', '', filename)
-        filename = re.sub(r'[^\w\s-]', '', filename).strip()
-        filename = re.sub(r'[-\s]+', '-', filename)
-        return filename[:100]  # Limit length
+        """Sanitize filename for Windows compatibility"""
+        if not filename:
+            return "unknown"
 
-    def get_video_by_id(self, video_id: str, db: Session) -> Video:
-        """Get video by ID from database"""
-        try:
-            return db.query(Video).filter(Video.id == video_id).first()
-        except Exception as e:
-            logger.error(f"Error getting video from database: {e}")
-            raise
+        # Remove invalid Windows filename characters
+        invalid_chars = r'<>:"/\|?*'
+        for char in invalid_chars:
+            filename = filename.replace(char, '')
 
-    def list_videos(self, db: Session, limit: int = 50) -> list:
-        """List videos from database"""
-        try:
-            return db.query(Video).order_by(Video.created_at.desc()).limit(limit).all()
-        except Exception as e:
-            logger.error(f"Error listing videos from database: {e}")
-            raise
+        # Remove non-printable characters
+        filename = ''.join(char for char in filename if ord(char) > 31)
 
-    def delete_video(self, video_id: str, db: Session) -> bool:
-        """Delete video and associated files"""
-        try:
-            video = db.query(Video).filter(Video.id == video_id).first()
-            if not video:
-                return False
+        # Replace multiple spaces/dashes with single dash
+        filename = re.sub(r'[\s\-]+', '-', filename)
 
-            # Delete audio file if exists
-            if video.audio_path and os.path.exists(video.audio_path):
-                os.remove(video.audio_path)
-                logger.info(f"Deleted audio file: {video.audio_path}")
+        # Remove leading/trailing dots and spaces
+        filename = filename.strip('. ')
 
-            # Delete video file if exists
-            if video.video_path and os.path.exists(video.video_path):
-                os.remove(video.video_path)
-                logger.info(f"Deleted video file: {video.video_path}")
+        # Limit length
+        return filename[:100] if filename else "unknown"
 
-            # Delete from database
-            db.delete(video)
-            db.commit()
-
-            return True
-        except Exception as e:
-            logger.error(f"Error deleting video: {e}")
-            db.rollback()
-            raise
+    def get_service_status(self) -> dict:
+        """Get comprehensive service status"""
+        return {
+            "download_directory": str(self.download_dir.absolute()),
+            "download_directory_exists": self.download_dir.exists(),
+            "ffmpeg_required": False,
+            "service_ready": True,
+            "system_test": self.test_system()
+        }

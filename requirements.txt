@@ -37,3 +37,5 @@ httpx==0.25.2
 # Optional: For better logging and monitoring
 structlog==23.2.0
 rich==13.7.0
+
+#  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
